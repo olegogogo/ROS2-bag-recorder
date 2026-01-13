@@ -1,0 +1,13 @@
+build/
+install/
+log/
+build_isolated/
+devel/
+dest/
+*.egg-info/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+rosbags/
+*.log
