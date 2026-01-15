@@ -16,6 +16,8 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from mavros_msgs.msg import State, ExtendedState
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+import threading
 
 class BagSessionManager(Node):
     def __init__(self):
@@ -29,44 +31,18 @@ class BagSessionManager(Node):
         self.declare_parameter('use_sigkill', False)
         
         # Topics to record
-        self.topics_to_record = [
-            '/camera_info',
-            '/debug_image/compressed',
-            '/mavros/state',
-            '/mavros/extended_state',
-            '/mavros/altitude',
-            '/mavros/battery',
-            '/mavros/estimator_status',
-            '/mavros/imu/data',
-            '/mavros/landing_target/pose',
-            '/mavros/local_position/odom',
-            '/mavros/local_position/pose',
-            '/mavros/local_position/velocity_body',
-            '/mavros/local_position/velocity_local',
-            '/setpoint_attitude/cmd_vel',
-            '/mavros/setpoint_attitude/thrust',
-            '/mavros/setpoint_position/global',
-            '/mavros/setpoint_position/global_to_local',
-            '/mavros/setpoint_position/local',
-            '/mavros/setpoint_raw/attitude',
-            '/mavros/setpoint_velocity/cmd_vel',
-            '/mavros/setpoint_velocity/cmd_vel_unstamped',
-            '/mavros/global_position/global',
-            '/rosout',
-            '/tf',
-            '/tf_static',
-            '/uwb/pose',
-            '/mavros/fake_gps/vision',
-            '/uwb/debug',
-            '/uwb/ranges',
-            '/uwb/gps'
-        ]
+        self.declare_parameter(
+            'topics_to_record', 
+            [''], 
+            ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
 
         self.base_dir = self.get_parameter('base_dir').get_parameter_value().string_value
         self.stop_retry_interval = self.get_parameter('stop_retry_interval_sec').get_parameter_value().double_value
         self.stop_sigint_retries = self.get_parameter('stop_sigint_retries').get_parameter_value().integer_value
         self.stop_sigterm_timeout = self.get_parameter('stop_sigterm_timeout_sec').get_parameter_value().double_value
         self.use_sigkill = self.get_parameter('use_sigkill').get_parameter_value().bool_value
+        self.topics_to_record = self.get_parameter('topics_to_record').get_parameter_value().string_array_value
 
         # State variables
         self.proc = None
@@ -216,7 +192,8 @@ class BagSessionManager(Node):
             # Actually, `subprocess.PIPE` means we hold the pipes. We should probably create a thread to drain them to a file.
             
             # Let's start a thread to handle logging to avoid blocking main thread
-            import threading
+            # Let's start a thread to handle logging to avoid blocking main thread
+            # import threading # Moved to top
             t = threading.Thread(target=self.log_writer_thread, args=(self.proc, bag_path))
             t.daemon = True
             t.start()

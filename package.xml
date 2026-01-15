@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>bag_session_manager</name>
+  <name>ros2_bag_recorder</name>
   <version>0.0.1</version>
-  <description>ROS 2 node for managing bag recording sessions based on mavros state</description>
-  <maintainer email="user@todo.todo">User</maintainer>
-  <license>TODO: License declaration</license>
+  <description>ROS2 Node for automated bag recording based on Mavros state</description>
+  <maintainer email="devittdv@gmail.com">devitt</maintainer>
+  <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>mavros_msgs</depend>

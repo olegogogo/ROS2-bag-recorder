@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    base_dir: "/media/orangepi/InnoSpector/rosbags"
+    stop_retry_interval_sec: 0.5
+    stop_sigint_retries: 20
+    stop_sigterm_timeout_sec: 5.0
+    use_sigkill: false
+    topics_to_record:
+      - "/camera_info"
+      - "/debug_image/compressed"
+      - "/mavros/state"
+      - "/mavros/extended_state"
+      - "/mavros/altitude"
+      - "/mavros/battery"
+      - "/mavros/estimator_status"
+      - "/mavros/imu/data"
+      - "/mavros/landing_target/pose"
+      - "/mavros/local_position/odom"
+      - "/mavros/local_position/pose"
+      - "/mavros/local_position/velocity_body"
+      - "/mavros/local_position/velocity_local"
+      - "/setpoint_attitude/cmd_vel"
+      - "/mavros/setpoint_attitude/thrust"
+      - "/mavros/setpoint_position/global"
+      - "/mavros/setpoint_position/global_to_local"
+      - "/mavros/setpoint_position/local"
+      - "/mavros/setpoint_raw/attitude"
+      - "/mavros/setpoint_velocity/cmd_vel"
+      - "/mavros/setpoint_velocity/cmd_vel_unstamped"
+      - "/mavros/global_position/global"
+      - "/rosout"
+      - "/tf"
+      - "/tf_static"
+      - "/uwb/pose"
+      - "/mavros/fake_gps/vision"
+      - "/uwb/debug"
+      - "/uwb/ranges"
+      - "/uwb/gps"
