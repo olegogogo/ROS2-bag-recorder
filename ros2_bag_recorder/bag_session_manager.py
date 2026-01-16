@@ -263,6 +263,7 @@ class BagSessionManager(Node):
             
             # Send notification
             msg = StatusText()
+            msg.header.stamp = self.get_clock().now().to_msg()
             msg.severity = StatusText.NOTICE
             msg.text = "log recorded"
             self.pub_statustext.publish(msg)
