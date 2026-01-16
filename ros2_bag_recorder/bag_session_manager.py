@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
-from mavros_msgs.msg import State, ExtendedState
+from mavros_msgs.msg import State, ExtendedState, StatusText
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 import threading
 
@@ -76,6 +76,12 @@ class BagSessionManager(Node):
             ExtendedState,
             '/mavros/extended_state',
             self.extended_state_cb,
+            10
+        )
+
+        self.pub_statustext = self.create_publisher(
+            StatusText,
+            '/mavros/statustext/send',
             10
         )
 
@@ -254,6 +260,13 @@ class BagSessionManager(Node):
         if self.proc.poll() is not None:
             # Process exited
             self.get_logger().info(f'Recording process exited with code {self.proc.returncode}')
+            
+            # Send notification
+            msg = StatusText()
+            msg.severity = StatusText.NOTICE
+            msg.text = "log recorded"
+            self.pub_statustext.publish(msg)
+
             self.proc = None
             self.cancel_stop_timer()
             
