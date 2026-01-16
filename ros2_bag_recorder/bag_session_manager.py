@@ -280,7 +280,7 @@ class BagSessionManager(Node):
             # Send notification
             msg = StatusText()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.severity = StatusText.NOTICE
+            msg.severity = StatusText.INFO
             msg.text = "Precision landing stopped. Log recorded"
             self.pub_statustext.publish(msg)
 
