@@ -7,6 +7,7 @@ import signal
 import subprocess
 import glob
 import re
+import shutil
 from datetime import datetime
 from threading import Timer
 
@@ -29,6 +30,7 @@ class BagSessionManager(Node):
         self.declare_parameter('stop_sigint_retries', 20)
         self.declare_parameter('stop_sigterm_timeout_sec', 5.0)
         self.declare_parameter('use_sigkill', False)
+        self.declare_parameter('max_storage_size_gb', 15.0)
         
         # Topics to record
         self.declare_parameter(
@@ -42,6 +44,7 @@ class BagSessionManager(Node):
         self.stop_sigint_retries = self.get_parameter('stop_sigint_retries').get_parameter_value().integer_value
         self.stop_sigterm_timeout = self.get_parameter('stop_sigterm_timeout_sec').get_parameter_value().double_value
         self.use_sigkill = self.get_parameter('use_sigkill').get_parameter_value().bool_value
+        self.max_storage_size_gb = self.get_parameter('max_storage_size_gb').get_parameter_value().double_value
         self.topics_to_record = self.get_parameter('topics_to_record').get_parameter_value().string_array_value
 
         # State variables
@@ -86,6 +89,9 @@ class BagSessionManager(Node):
         )
 
         self.get_logger().info(f'Bag Session Manager initialized. Base dir: {self.base_dir}')
+        
+        # Initial cleanup
+        self.check_and_cleanup_storage()
 
     def state_cb(self, msg: State):
         current_armed = msg.armed
@@ -163,6 +169,9 @@ class BagSessionManager(Node):
         return max_flight + 1
 
     def start_recording(self):
+        # Cleanup before start
+        self.check_and_cleanup_storage()
+        
         flight_num = self.find_next_flight_number()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bag_name = f'{timestamp}_flight{flight_num:03d}'
@@ -304,6 +313,71 @@ class BagSessionManager(Node):
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+
+    def get_dir_size(self, path):
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file():
+                    total += entry.stat().st_size
+                elif entry.is_dir():
+                    total += self.get_dir_size(entry.path)
+        except Exception:
+            pass
+        return total
+
+    def check_and_cleanup_storage(self):
+        if not os.path.exists(self.base_dir):
+            return
+
+        limit_bytes = self.max_storage_size_gb * 1024 * 1024 * 1024
+        
+        # Gather all session folders
+        # We assume only directories matching our pattern or created by us should be managed?
+        # Or just all directories in base_dir?
+        # Let's target all subdirectories to be safe, but maybe we should filter by pattern to avoid deleting user config stuff?
+        # User requested: "удалялись старые логи". Logs are in "timestamp_flightNNN".
+        # Let's trust that base_dir contains mainly logs.
+        
+        try:
+            items = []
+            total_size = 0
+            
+            for d in os.listdir(self.base_dir):
+                path = os.path.join(self.base_dir, d)
+                if os.path.isdir(path):
+                    size = self.get_dir_size(path)
+                    mtime = os.path.getmtime(path)
+                    items.append({'path': path, 'size': size, 'mtime': mtime, 'name': d})
+                    total_size += size
+            
+            self.get_logger().info(f'Current storage usage: {total_size / (1024**3):.2f} GB / {self.max_storage_size_gb:.2f} GB')
+            
+            if total_size <= limit_bytes:
+                return
+                
+            # Need to delete
+            # Sort by mtime (oldest first)
+            items.sort(key=lambda x: x['mtime'])
+            
+            deleted_count = 0
+            for item in items:
+                if total_size <= limit_bytes:
+                    break
+                
+                self.get_logger().warn(f'Storage limit exceeded. Deleting old session: {item["name"]} ({item["size"] / (1024**2):.1f} MB)')
+                try:
+                    shutil.rmtree(item['path'])
+                    total_size -= item['size']
+                    deleted_count += 1
+                except Exception as e:
+                    self.get_logger().error(f'Failed to delete {item["name"]}: {e}')
+                    
+            if deleted_count > 0:
+                self.get_logger().info(f'Cleanup complete. Deleted {deleted_count} old sessions.')
+                
+        except Exception as e:
+            self.get_logger().error(f'Error during storage cleanup: {e}')
 
     def destroy_node(self):
         # Cleanup on shutdown
