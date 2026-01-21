@@ -212,6 +212,13 @@ class BagSessionManager(Node):
             t = threading.Thread(target=self.log_writer_thread, args=(self.proc, bag_path))
             t.daemon = True
             t.start()
+
+            # Send notification
+            msg = StatusText()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.severity = StatusText.NOTICE
+            msg.text = "Precision landing started. Log recording..."
+            self.pub_statustext.publish(msg)
             
         except Exception as e:
             self.get_logger().error(f'Failed to start ros2 bag record: {e}')
@@ -274,7 +281,7 @@ class BagSessionManager(Node):
             msg = StatusText()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.severity = StatusText.NOTICE
-            msg.text = "log recorded"
+            msg.text = "Precision landing stopped. Log recorded"
             self.pub_statustext.publish(msg)
 
             self.proc = None
