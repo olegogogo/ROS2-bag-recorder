@@ -36,3 +36,5 @@
       - "/uwb/debug"
       - "/uwb/ranges"
       - "/uwb/gps"
+      - "/mavros/mission/reached"
+      - "/mavros/mission/waypoints"
