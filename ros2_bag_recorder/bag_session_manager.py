@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 
 import os
-import sys
 import time
 import signal
 import subprocess
-import glob
 import re
 import shutil
 from datetime import datetime
-from threading import Timer
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from mavros_msgs.msg import State, ExtendedState, StatusText
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -45,7 +40,8 @@ class BagSessionManager(Node):
         self.stop_sigterm_timeout = self.get_parameter('stop_sigterm_timeout_sec').get_parameter_value().double_value
         self.use_sigkill = self.get_parameter('use_sigkill').get_parameter_value().bool_value
         self.max_storage_size_gb = self.get_parameter('max_storage_size_gb').get_parameter_value().double_value
-        self.topics_to_record = self.get_parameter('topics_to_record').get_parameter_value().string_array_value
+        raw_topics = self.get_parameter('topics_to_record').get_parameter_value().string_array_value
+        self.topics_to_record = [t for t in raw_topics if t]
 
         # State variables
         self.proc = None
@@ -55,18 +51,7 @@ class BagSessionManager(Node):
         self.pending_start = False
         self.stop_timer = None
         self.stop_attempts = 0
-
-        # Create QoS profile for state subscriptions (Best to be reliable)
-        qos_bucket = QoSProfile(
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT, # standard for sensor data/state usually
-            durability=QoSDurabilityPolicy.VOLATILE
-        )
-        
-        # MAVROS state is essentially reliable in default profile, but let's check standard usage.
-        # Actually ros2 mavros usually uses SystemDefault or SensorData. Let's stick to default (reliable/keep last 10) or explicit reliable.
-        # However user didn't specify, so I will use default QoS for now which matches most standard pubs.
+        self.state_subscribed = False
 
         self.sub_state = self.create_subscription(
             State,
@@ -94,6 +79,14 @@ class BagSessionManager(Node):
         self.check_and_cleanup_storage()
 
     def state_cb(self, msg: State):
+        if not self.state_subscribed:
+            self.state_subscribed = True
+            stat = StatusText()
+            stat.header.stamp = self.get_clock().now().to_msg()
+            stat.severity = StatusText.INFO
+            stat.text = "Subscribed to /mavros/state"
+            self.pub_statustext.publish(stat)
+
         current_armed = msg.armed
         
         # Detect transition False -> True (ARM START)
@@ -171,7 +164,11 @@ class BagSessionManager(Node):
     def start_recording(self):
         # Cleanup before start
         self.check_and_cleanup_storage()
-        
+
+        if not self.topics_to_record:
+            self.get_logger().error('No topics configured for recording. Skipping start.')
+            return
+
         flight_num = self.find_next_flight_number()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bag_name = f'{timestamp}_flight{flight_num:03d}'
@@ -216,7 +213,7 @@ class BagSessionManager(Node):
             # Send notification
             msg = StatusText()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.severity = StatusText.NOTICE
+            msg.severity = StatusText.INFO
             msg.text = "Precision landing started. Log recording..."
             self.pub_statustext.publish(msg)
             
@@ -262,6 +259,10 @@ class BagSessionManager(Node):
                 self.start_recording()
             return
         
+        if self.stop_timer is not None:
+            self.get_logger().info('Stop already in progress; ignoring duplicate stop request.')
+            return
+
         self.get_logger().info('Stopping recording process...')
         self.stop_attempts = 0
         
