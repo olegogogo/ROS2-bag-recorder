@@ -52,6 +52,10 @@ class BagSessionManager(Node):
         self.stop_timer = None
         self.stop_attempts = 0
         self.state_subscribed = False
+        self.current_bag_path = None
+        self.log_thread = None
+        self.finalizing_stop = False
+        self.stop_notified = False
 
         self.sub_state = self.create_subscription(
             State,
@@ -112,6 +116,10 @@ class BagSessionManager(Node):
                  self.stop_recording_routine()
 
     def handle_start_request(self):
+        if self.finalizing_stop:
+            self.get_logger().warn('Start requested while stop is finalizing. Marking pending_start.')
+            self.pending_start = True
+            return
         if self.proc is not None:
              if self.proc.poll() is None:
                  self.get_logger().warn('Start requested but recording is already in progress. Marking pending_start.')
@@ -169,10 +177,13 @@ class BagSessionManager(Node):
             self.get_logger().error('No topics configured for recording. Skipping start.')
             return
 
+        self.finalizing_stop = False
+        self.stop_notified = False
         flight_num = self.find_next_flight_number()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bag_name = f'{timestamp}_flight{flight_num:03d}'
         bag_path = os.path.join(self.base_dir, bag_name)
+        self.current_bag_path = bag_path
         
         cmd = ['ros2', 'bag', 'record', '--storage', 'mcap', '-o', bag_path] + self.topics_to_record
         
@@ -209,12 +220,13 @@ class BagSessionManager(Node):
             t = threading.Thread(target=self.log_writer_thread, args=(self.proc, bag_path))
             t.daemon = True
             t.start()
+            self.log_thread = t
 
             # Send notification
             msg = StatusText()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.severity = StatusText.INFO
-            msg.text = "Precision landing started. Log recording..."
+            msg.text = "Precision landing started."
             self.pub_statustext.publish(msg)
             
         except Exception as e:
@@ -250,6 +262,70 @@ class BagSessionManager(Node):
         except Exception as e:
             self.get_logger().error(f'Log writer failed: {e}')
 
+    def get_latest_mtime(self, path):
+        latest = None
+        try:
+            for root, _, files in os.walk(path):
+                for name in files:
+                    try:
+                        mtime = os.path.getmtime(os.path.join(root, name))
+                        if latest is None or mtime > latest:
+                            latest = mtime
+                    except OSError:
+                        continue
+        except Exception:
+            return None
+        return latest
+
+    def wait_for_bag_finalize(self, bag_path, log_thread):
+        if log_thread is not None and log_thread.is_alive():
+            log_thread.join(timeout=2.0)
+
+        if not bag_path or not os.path.exists(bag_path):
+            return
+
+        end_time = time.time() + 5.0
+        last_mtime = None
+        stable_since = None
+
+        while time.time() < end_time:
+            latest_mtime = self.get_latest_mtime(bag_path)
+            if latest_mtime is None:
+                break
+
+            if last_mtime is not None and latest_mtime == last_mtime:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= 0.5:
+                    break
+            else:
+                stable_since = None
+                last_mtime = latest_mtime
+
+            time.sleep(0.1)
+
+    def finalize_stop_and_notify(self, bag_path, log_thread):
+        self.wait_for_bag_finalize(bag_path, log_thread)
+
+        if self.stop_notified:
+            return
+        self.stop_notified = True
+
+        msg = StatusText()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.severity = StatusText.INFO
+        msg.text = "Precision landing stopped. Log recorded"
+        self.pub_statustext.publish(msg)
+
+        self.finalizing_stop = False
+        self.current_bag_path = None
+        self.log_thread = None
+
+        if self.pending_start:
+            self.get_logger().info('Executing pending start...')
+            self.pending_start = False
+            self.start_recording()
+
     def stop_recording_routine(self):
         if self.proc is None:
             self.get_logger().info('Stop requested but no process running.')
@@ -277,21 +353,17 @@ class BagSessionManager(Node):
         if self.proc.poll() is not None:
             # Process exited
             self.get_logger().info(f'Recording process exited with code {self.proc.returncode}')
-            
-            # Send notification
-            msg = StatusText()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.severity = StatusText.INFO
-            msg.text = "Precision landing stopped. Log recorded"
-            self.pub_statustext.publish(msg)
+
+            self.finalizing_stop = True
+            bag_path = self.current_bag_path
+            log_thread = self.log_thread
 
             self.proc = None
             self.cancel_stop_timer()
-            
-            if self.pending_start:
-                self.get_logger().info('Executing pending start...')
-                self.pending_start = False
-                self.start_recording()
+
+            t = threading.Thread(target=self.finalize_stop_and_notify, args=(bag_path, log_thread))
+            t.daemon = True
+            t.start()
             return
 
         # Still running
