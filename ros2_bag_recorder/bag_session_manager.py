@@ -20,7 +20,7 @@ class BagSessionManager(Node):
         super().__init__('bag_session_manager')
 
         # Parameters
-        self.declare_parameter('base_dir', '/media/orangepi/InnoSpector/rosbags')
+        self.declare_parameter('base_dir', '/home/orangepi/rosbags')
         self.declare_parameter('stop_retry_interval_sec', 0.5)
         self.declare_parameter('stop_sigint_retries', 20)
         self.declare_parameter('stop_sigterm_timeout_sec', 5.0)
