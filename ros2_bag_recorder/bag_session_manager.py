@@ -7,13 +7,16 @@ import subprocess
 import re
 import shutil
 from datetime import datetime
+import threading
 
 import rclpy
 from rclpy.node import Node
 
 from mavros_msgs.msg import State, ExtendedState, StatusText
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
-import threading
+
+LOG_FILENAME = 'ros2_bag_record.log'
+LOG_STOP_MARKER = 'Recording stopped'
 
 class BagSessionManager(Node):
     def __init__(self):
@@ -53,9 +56,9 @@ class BagSessionManager(Node):
         self.stop_attempts = 0
         self.state_subscribed = False
         self.current_bag_path = None
+        self.current_flight_num = None
         self.log_thread = None
         self.finalizing_stop = False
-        self.stop_notified = False
 
         self.sub_state = self.create_subscription(
             State,
@@ -79,26 +82,31 @@ class BagSessionManager(Node):
 
         self.get_logger().info(f'Bag Session Manager initialized. Base dir: {self.base_dir}')
         
-        # Initial cleanup
         self.check_and_cleanup_storage()
+
+    def publish_statustext(self, text, severity=StatusText.INFO):
+        msg = StatusText()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.severity = severity
+        msg.text = text
+        self.pub_statustext.publish(msg)
+
+    def get_log_paths(self, bag_path):
+        bag_log = os.path.join(bag_path, LOG_FILENAME)
+        fallback_log = os.path.join(self.base_dir, f'{os.path.basename(bag_path)}.log')
+        return [bag_log, fallback_log]
 
     def state_cb(self, msg: State):
         if not self.state_subscribed:
             self.state_subscribed = True
-            stat = StatusText()
-            stat.header.stamp = self.get_clock().now().to_msg()
-            stat.severity = StatusText.INFO
-            stat.text = "Subscribed to /mavros/state"
-            self.pub_statustext.publish(stat)
+            self.publish_statustext('Subscribed to /mavros/state')
 
         current_armed = msg.armed
         
-        # Detect transition False -> True (ARM START)
         if self.last_armed is not None and not self.last_armed and current_armed:
             self.get_logger().info('Detected ARM transition. Requesting START.')
             self.handle_start_request()
 
-        # Detect transition True -> False (DISARM pending STOP)
         if self.last_armed is not None and self.last_armed and not current_armed:
             self.get_logger().info('Detected DISARM transition. Checking landed state for STOP.')
             self.handle_stop_request()
@@ -108,12 +116,11 @@ class BagSessionManager(Node):
     def extended_state_cb(self, msg: ExtendedState):
         self.last_landed_state = msg.landed_state
         
-        # If we were waiting for ON_GROUND to stop
         if self.pending_stop:
-             if self.last_landed_state == ExtendedState.LANDED_STATE_ON_GROUND:
-                 self.get_logger().info('Landed state confirmed ON_GROUND. Executing STOP.')
-                 self.pending_stop = False
-                 self.stop_recording_routine()
+            if self.last_landed_state == ExtendedState.LANDED_STATE_ON_GROUND:
+                self.get_logger().info('Landed state confirmed ON_GROUND. Executing STOP.')
+                self.pending_stop = False
+                self.stop_recording_routine()
 
     def handle_start_request(self):
         if self.finalizing_stop:
@@ -121,22 +128,15 @@ class BagSessionManager(Node):
             self.pending_start = True
             return
         if self.proc is not None:
-             if self.proc.poll() is None:
-                 self.get_logger().warn('Start requested but recording is already in progress. Marking pending_start.')
-                 self.pending_start = True
-                 self.pending_stop = True # Force stop current if we re-armed? 
-                 # Wait, user guideline: "Start new session". 
-                 # If we re-armed while recording, we should probably stop the current one and start new, or just ignore?
-                 # Prompt says: "START не должен запускать новую запись, если текущая запись ещё не остановлена."
-                 # "Если пришёл ARM (armed=True), пока STOP ещё в процессе (proc жив) — поставить pending_start=True"
-                 # This implies we should wait for stop to finish.
-                 return
+            if self.proc.poll() is None:
+                self.get_logger().warn('Start requested but recording is already in progress. Marking pending_start.')
+                self.pending_start = True
+                self.pending_stop = True
+                return
 
         self.start_recording()
 
     def handle_stop_request(self):
-        # Trigger STOP logic
-        # Check if ON_GROUND
         if self.last_landed_state == ExtendedState.LANDED_STATE_ON_GROUND:
             self.stop_recording_routine()
         else:
@@ -149,10 +149,8 @@ class BagSessionManager(Node):
                 os.makedirs(self.base_dir, exist_ok=True)
             except OSError as e:
                 self.get_logger().error(f'Failed to create base dir: {e}')
-                return 1 # Fallback default
+                return 1
         
-        # Pattern: *_flightNNN
-        # We need to scan directories
         subdirs = [d for d in os.listdir(self.base_dir) if os.path.isdir(os.path.join(self.base_dir, d))]
         max_flight = 0
         pattern = re.compile(r'_flight(\d{3})$')
@@ -170,7 +168,6 @@ class BagSessionManager(Node):
         return max_flight + 1
 
     def start_recording(self):
-        # Cleanup before start
         self.check_and_cleanup_storage()
 
         if not self.topics_to_record:
@@ -178,19 +175,18 @@ class BagSessionManager(Node):
             return
 
         self.finalizing_stop = False
-        self.stop_notified = False
         flight_num = self.find_next_flight_number()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bag_name = f'{timestamp}_flight{flight_num:03d}'
         bag_path = os.path.join(self.base_dir, bag_name)
         self.current_bag_path = bag_path
+        self.current_flight_num = flight_num
         
         cmd = ['ros2', 'bag', 'record', '--storage', 'mcap', '-o', bag_path] + self.topics_to_record
         
         self.get_logger().info(f'Starting recording: {bag_name}')
         
         try:
-            # Create process group for easier signal handling
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -198,36 +194,12 @@ class BagSessionManager(Node):
                 preexec_fn=os.setsid
             )
             
-            # Non-blocking read of stdout/stderr could be complex, for now user requested log file in bag dir.
-            # But bag dir doesn't exist until process starts writing.
-            # Actually user said: "Stdout/stderr писать в лог-файл внутри папки сессии".
-            # ros2 bag record creates the folder immediately.
-            # We can spawn a thread or just let it run and capture output later?
-            # Better: Redirect process output to a file directly if possible, or use a separate thread logger.
-            # Since we need to write to a file inside the bag dir, and we know the path:
-            # We should wait a sec for dir creation or just create it ourselves? 
-            # ros2 bag record complains if dir exists unless we assume it handles it (it typically creates it).
-            # If we create it, ros2 bag record might fail saying "exists".
-            # So we rely on rosbag to create it.
-            
-            # Start a timer to setup logging once dir exists?
-            # Or just redirect to /tmp first and move?
-            # Actually, `subprocess.PIPE` means we hold the pipes. We should probably create a thread to drain them to a file.
-            
-            # Let's start a thread to handle logging to avoid blocking main thread
-            # Let's start a thread to handle logging to avoid blocking main thread
-            # import threading # Moved to top
             t = threading.Thread(target=self.log_writer_thread, args=(self.proc, bag_path))
             t.daemon = True
             t.start()
             self.log_thread = t
 
-            # Send notification
-            msg = StatusText()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.severity = StatusText.INFO
-            msg.text = "Precision landing started."
-            self.pub_statustext.publish(msg)
+            self.publish_statustext(f'Precision landing started. Flight {flight_num:03d}.')
             
         except Exception as e:
             self.get_logger().error(f'Failed to start ros2 bag record: {e}')
@@ -240,11 +212,9 @@ class BagSessionManager(Node):
             if os.path.exists(bag_path):
                 break
             time.sleep(0.1)
-            
-        log_file_path = os.path.join(bag_path, 'ros2_bag_record.log')
-        if not os.path.exists(bag_path):
-            # Fallback if bag dir validation failed or delayed
-            log_file_path = os.path.join(self.base_dir, f'{os.path.basename(bag_path)}.log')
+
+        log_paths = self.get_log_paths(bag_path)
+        log_file_path = log_paths[0] if os.path.exists(bag_path) else log_paths[1]
 
         try:
             with open(log_file_path, 'wb') as f:
@@ -253,9 +223,7 @@ class BagSessionManager(Node):
                     if not line:
                         break
                     f.write(line)
-                    # Also flush immediately?
                     f.flush()
-                # Dump remaining
                 rest = proc.stdout.read()
                 if rest:
                     f.write(rest)
@@ -304,32 +272,60 @@ class BagSessionManager(Node):
 
             time.sleep(0.1)
 
-    def finalize_stop_and_notify(self, bag_path, log_thread):
+    def wait_for_log_line(self, bag_path, needle, timeout_sec=None):
+        if not bag_path:
+            return False
+
+        log_paths = self.get_log_paths(bag_path)
+
+        found_log = False
+        end_time = None if timeout_sec is None else time.time() + timeout_sec
+        positions = {path: 0 for path in log_paths}
+
+        while end_time is None or time.time() < end_time:
+            for path in log_paths:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, 'r', errors='ignore') as f:
+                        f.seek(0, os.SEEK_END)
+                        end_pos = f.tell()
+                        last_pos = positions.get(path, 0)
+                        if last_pos > end_pos:
+                            last_pos = 0
+                        f.seek(last_pos)
+                        data = f.read()
+                        positions[path] = f.tell()
+                        if needle in data:
+                            found_log = True
+                            break
+                except OSError:
+                    continue
+
+            if found_log:
+                break
+
+            time.sleep(0.1)
+
+        return found_log
+
+    def notify_when_log_stopped(self, bag_path, log_thread, flight_num):
         self.wait_for_bag_finalize(bag_path, log_thread)
 
-        if self.stop_notified:
-            return
-        self.stop_notified = True
+        self.wait_for_log_line(
+            bag_path,
+            LOG_STOP_MARKER
+        )
 
-        msg = StatusText()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.severity = StatusText.INFO
-        msg.text = "Precision landing stopped. Log recorded"
-        self.pub_statustext.publish(msg)
-
-        self.finalizing_stop = False
-        self.current_bag_path = None
-        self.log_thread = None
-
-        if self.pending_start:
-            self.get_logger().info('Executing pending start...')
-            self.pending_start = False
-            self.start_recording()
+        if flight_num is not None:
+            text = f'Precision landing stopped. Log recorded. Flight {flight_num:03d}.'
+        else:
+            text = 'Precision landing stopped. Log recorded.'
+        self.publish_statustext(text)
 
     def stop_recording_routine(self):
         if self.proc is None:
             self.get_logger().info('Stop requested but no process running.')
-            # Check pending start
             if self.pending_start:
                 self.pending_start = False
                 self.start_recording()
@@ -341,8 +337,8 @@ class BagSessionManager(Node):
 
         self.get_logger().info('Stopping recording process...')
         self.stop_attempts = 0
+        self.finalizing_stop = True
         
-        # Start STOP timer
         self.stop_timer = self.create_timer(self.stop_retry_interval, self.check_stop_process)
 
     def check_stop_process(self):
@@ -351,28 +347,34 @@ class BagSessionManager(Node):
             return
 
         if self.proc.poll() is not None:
-            # Process exited
             self.get_logger().info(f'Recording process exited with code {self.proc.returncode}')
 
-            self.finalizing_stop = True
             bag_path = self.current_bag_path
             log_thread = self.log_thread
+            flight_num = self.current_flight_num
 
             self.proc = None
+            self.current_bag_path = None
+            self.log_thread = None
+            self.current_flight_num = None
+            self.finalizing_stop = False
             self.cancel_stop_timer()
 
-            t = threading.Thread(target=self.finalize_stop_and_notify, args=(bag_path, log_thread))
+            t = threading.Thread(target=self.notify_when_log_stopped, args=(bag_path, log_thread, flight_num))
             t.daemon = True
             t.start()
+
+            if self.pending_start:
+                self.get_logger().info('Executing pending start...')
+                self.pending_start = False
+                self.start_recording()
             return
 
-        # Still running
         self.stop_attempts += 1
         
         try:
             pgid = os.getpgid(self.proc.pid)
         except ProcessLookupError:
-            # already gone
             return
 
         if self.stop_attempts <= self.stop_sigint_retries:
@@ -384,10 +386,10 @@ class BagSessionManager(Node):
             os.killpg(pgid, signal.SIGTERM)
             
         elif self.use_sigkill:
-             self.get_logger().error('SIGTERM timeout. Sending SIGKILL.')
-             os.killpg(pgid, signal.SIGKILL)
+            self.get_logger().error('SIGTERM timeout. Sending SIGKILL.')
+            os.killpg(pgid, signal.SIGKILL)
         else:
-             self.get_logger().warn('Process still not stopping, but SIGKILL is disabled (or next cycle).')
+            self.get_logger().warn('Process still not stopping, but SIGKILL is disabled (or next cycle).')
 
     def cancel_stop_timer(self):
         if self.stop_timer:
@@ -412,13 +414,6 @@ class BagSessionManager(Node):
 
         limit_bytes = self.max_storage_size_gb * 1024 * 1024 * 1024
         
-        # Gather all session folders
-        # We assume only directories matching our pattern or created by us should be managed?
-        # Or just all directories in base_dir?
-        # Let's target all subdirectories to be safe, but maybe we should filter by pattern to avoid deleting user config stuff?
-        # User requested: "удалялись старые логи". Logs are in "timestamp_flightNNN".
-        # Let's trust that base_dir contains mainly logs.
-        
         try:
             items = []
             total_size = 0
@@ -436,8 +431,6 @@ class BagSessionManager(Node):
             if total_size <= limit_bytes:
                 return
                 
-            # Need to delete
-            # Sort by mtime (oldest first)
             items.sort(key=lambda x: x['mtime'])
             
             deleted_count = 0
@@ -460,7 +453,6 @@ class BagSessionManager(Node):
             self.get_logger().error(f'Error during storage cleanup: {e}')
 
     def destroy_node(self):
-        # Cleanup on shutdown
         if self.proc is not None and self.proc.poll() is None:
             self.get_logger().info('Node shutdown: forcing bag stop.')
             try:
