@@ -53,6 +53,7 @@ class BagSessionManager(Node):
         self.pending_stop = False
         self.pending_start = False
         self.stop_timer = None
+        self.stop_delay_timer = None
         self.stop_attempts = 0
         self.state_subscribed = False
         self.current_bag_path = None
@@ -95,6 +96,17 @@ class BagSessionManager(Node):
         bag_log = os.path.join(bag_path, LOG_FILENAME)
         fallback_log = os.path.join(self.base_dir, f'{os.path.basename(bag_path)}.log')
         return [bag_log, fallback_log]
+
+    def extract_flight_number(self, bag_path):
+        if not bag_path:
+            return None
+        match = re.search(r'_flight(\d{3})', os.path.basename(bag_path))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
 
     def state_cb(self, msg: State):
         if not self.state_subscribed:
@@ -184,7 +196,9 @@ class BagSessionManager(Node):
         
         cmd = ['ros2', 'bag', 'record', '--storage', 'mcap', '-o', bag_path] + self.topics_to_record
         
-        self.get_logger().info(f'Starting recording: {bag_name}')
+        self.get_logger().info(
+            f'Starting recording: {bag_name} (flight_num={flight_num:03d}, bag_path={bag_path})'
+        )
         
         try:
             self.proc = subprocess.Popen(
@@ -331,14 +345,27 @@ class BagSessionManager(Node):
                 self.start_recording()
             return
         
-        if self.stop_timer is not None:
+        if self.stop_timer is not None or self.stop_delay_timer is not None:
             self.get_logger().info('Stop already in progress; ignoring duplicate stop request.')
             return
 
-        self.get_logger().info('Stopping recording process...')
+        self.get_logger().info(
+            'Stopping recording process in 1.0s... '
+            f'(current_flight_num={self.current_flight_num}, bag_path={self.current_bag_path})'
+        )
         self.stop_attempts = 0
         self.finalizing_stop = True
-        
+        self.stop_delay_timer = self.create_timer(1.0, self.begin_stop_process)
+
+    def begin_stop_process(self):
+        if self.stop_delay_timer:
+            self.stop_delay_timer.cancel()
+            self.stop_delay_timer = None
+
+        if self.proc is None:
+            self.cancel_stop_timer()
+            return
+
         self.stop_timer = self.create_timer(self.stop_retry_interval, self.check_stop_process)
 
     def check_stop_process(self):
@@ -352,6 +379,11 @@ class BagSessionManager(Node):
             bag_path = self.current_bag_path
             log_thread = self.log_thread
             flight_num = self.current_flight_num
+            if not flight_num:
+                flight_num = self.extract_flight_number(bag_path)
+            self.get_logger().info(
+                f'Finalizing stop (flight_num={flight_num}, bag_path={bag_path})'
+            )
 
             self.proc = None
             self.current_bag_path = None
@@ -395,6 +427,9 @@ class BagSessionManager(Node):
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+        if self.stop_delay_timer:
+            self.stop_delay_timer.cancel()
+            self.stop_delay_timer = None
 
     def get_dir_size(self, path):
         total = 0
