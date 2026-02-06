@@ -12,7 +12,7 @@ import threading
 import rclpy
 from rclpy.node import Node
 
-from mavros_msgs.msg import State, ExtendedState, StatusText
+from mavros_msgs.msg import State, StatusText
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 LOG_FILENAME = 'ros2_bag_record.log'
@@ -49,8 +49,6 @@ class BagSessionManager(Node):
         # State variables
         self.proc = None
         self.last_armed = None
-        self.last_landed_state = None
-        self.pending_stop = False
         self.pending_start = False
         self.stop_timer = None
         self.stop_delay_timer = None
@@ -68,13 +66,6 @@ class BagSessionManager(Node):
             10
         )
         
-        self.sub_extended_state = self.create_subscription(
-            ExtendedState,
-            '/mavros/extended_state',
-            self.extended_state_cb,
-            10
-        )
-
         self.pub_statustext = self.create_publisher(
             StatusText,
             '/mavros/statustext/send',
@@ -125,15 +116,6 @@ class BagSessionManager(Node):
 
         self.last_armed = current_armed
 
-    def extended_state_cb(self, msg: ExtendedState):
-        self.last_landed_state = msg.landed_state
-        
-        if self.pending_stop:
-            if self.last_landed_state == ExtendedState.LANDED_STATE_ON_GROUND:
-                self.get_logger().info('Landed state confirmed ON_GROUND. Executing STOP.')
-                self.pending_stop = False
-                self.stop_recording_routine()
-
     def handle_start_request(self):
         if self.finalizing_stop:
             self.get_logger().warn('Start requested while stop is finalizing. Marking pending_start.')
@@ -141,19 +123,13 @@ class BagSessionManager(Node):
             return
         if self.proc is not None:
             if self.proc.poll() is None:
-                self.get_logger().warn('Start requested but recording is already in progress. Marking pending_start.')
-                self.pending_start = True
-                self.pending_stop = True
+                self.get_logger().warn('Start requested but recording is already in progress. Ignoring.')
                 return
 
         self.start_recording()
 
     def handle_stop_request(self):
-        if self.last_landed_state == ExtendedState.LANDED_STATE_ON_GROUND:
-            self.stop_recording_routine()
-        else:
-            self.get_logger().info('DISARMED but not ON_GROUND (or unknown). Setting pending_stop.')
-            self.pending_stop = True
+        self.stop_recording_routine()
 
     def find_next_flight_number(self) -> int:
         if not os.path.exists(self.base_dir):
